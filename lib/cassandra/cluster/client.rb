@@ -1,112 +1,112 @@
-# encoding: utf-8
+  # encoding: utf-8
 
-#--
-# Copyright DataStax, Inc.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#++
+  #--
+  # Copyright DataStax, Inc.
+  #
+  # Licensed under the Apache License, Version 2.0 (the "License");
+  # you may not use this file except in compliance with the License.
+  # You may obtain a copy of the License at
+  #
+  # http://www.apache.org/licenses/LICENSE-2.0
+  #
+  # Unless required by applicable law or agreed to in writing, software
+  # distributed under the License is distributed on an "AS IS" BASIS,
+  # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  # See the License for the specific language governing permissions and
+  # limitations under the License.
+  #++
 
-module Cassandra
-  class Cluster
-    # @private
-    class Client
-      include MonitorMixin
+  module Cassandra
+    class Cluster
+      # @private
+      class Client
+        include MonitorMixin
 
-      attr_reader :keyspace
+        attr_reader :keyspace
 
-      def initialize(logger,
-                     cluster_registry,
-                     cluster_schema,
-                     io_reactor,
-                     connector,
-                     profile_manager,
-                     reconnection_policy,
-                     address_resolution_policy,
-                     connection_options,
-                     futures_factory,
-                     timestamp_generator)
-        @logger                      = logger
-        @registry                    = cluster_registry
-        @schema                      = cluster_schema
-        @reactor                     = io_reactor
-        @connector                   = connector
-        @profile_manager             = profile_manager
-        @reconnection_policy         = reconnection_policy
-        @address_resolver            = address_resolution_policy
-        @connection_options          = connection_options
-        @futures                     = futures_factory
-        @connections                 = ::Hash.new
-        @prepared_statements         = ::Hash.new
-        @preparing_statements        = ::Hash.new {|hash, host| hash[host] = {}}
-        @pending_connections         = ::Hash.new
-        @keyspace                    = nil
-        @state                       = :idle
-        @timestamp_generator         = timestamp_generator
+        def initialize(logger,
+                       cluster_registry,
+                       cluster_schema,
+                       io_reactor,
+                       connector,
+                       profile_manager,
+                       reconnection_policy,
+                       address_resolution_policy,
+                       connection_options,
+                       futures_factory,
+                       timestamp_generator)
+          @logger                      = logger
+          @registry                    = cluster_registry
+          @schema                      = cluster_schema
+          @reactor                     = io_reactor
+          @connector                   = connector
+          @profile_manager             = profile_manager
+          @reconnection_policy         = reconnection_policy
+          @address_resolver            = address_resolution_policy
+          @connection_options          = connection_options
+          @futures                     = futures_factory
+          @connections                 = ::Hash.new
+          @prepared_statements         = ::Hash.new
+          @preparing_statements        = ::Hash.new {|hash, host| hash[host] = {}}
+          @pending_connections         = ::Hash.new
+          @keyspace                    = nil
+          @state                       = :idle
+          @timestamp_generator         = timestamp_generator
 
-        mon_initialize
-      end
-
-      def connect
-        connecting_hosts = ::Hash.new
-
-        synchronize do
-          return CLIENT_CLOSED     if @state == :closed || @state == :closing
-          return @connected_future if @state == :connecting || @state == :connected
-
-          @state = :connecting
-          @registry.each_host do |host|
-            distance = @profile_manager.distance(host)
-
-            case distance
-            when :ignore
-              next
-            when :local
-              pool_size = @connection_options.connections_per_local_node
-            when :remote
-              pool_size = @connection_options.connections_per_remote_node
-            else
-              @logger.error("Not connecting to #{host.ip} - invalid load balancing " \
-                'distance. Distance must be one of ' \
-                "#{LoadBalancing::DISTANCES.inspect}, #{distance.inspect} given")
-              next
-            end
-
-            connecting_hosts[host] = pool_size
-            @pending_connections[host] = 0
-            @preparing_statements[host] = {}
-            @connections[host] = ConnectionPool.new
-          end
+          mon_initialize
         end
 
-        @connected_future = begin
-          @logger.info('Creating session')
-          @registry.add_listener(self)
-          @schema.add_listener(self)
+        def connect
+          connecting_hosts = ::Hash.new
 
-          futures = connecting_hosts.map do |(host, pool_size)|
-            f = connect_to_host(host, pool_size)
-            f.recover do |error|
-              FailedConnection.new(error, host)
+          synchronize do
+            return CLIENT_CLOSED     if @state == :closed || @state == :closing
+            return @connected_future if @state == :connecting || @state == :connected
+
+            @state = :connecting
+            @registry.each_host do |host|
+              distance = @profile_manager.distance(host)
+
+              case distance
+              when :ignore
+                next
+              when :local
+                pool_size = @connection_options.connections_per_local_node
+              when :remote
+                pool_size = @connection_options.connections_per_remote_node
+              else
+                @logger.error("Not connecting to #{host.ip} - invalid load balancing " \
+                  'distance. Distance must be one of ' \
+                  "#{LoadBalancing::DISTANCES.inspect}, #{distance.inspect} given")
+                next
+              end
+
+              connecting_hosts[host] = pool_size
+              @pending_connections[host] = 0
+              @preparing_statements[host] = {}
+              @connections[host] = ConnectionPool.new
             end
           end
 
-          Ione::Future.all(*futures).map do |connections|
-            connections.flatten!
-            raise NO_HOSTS if connections.empty?
+          @connected_future = begin
+            @logger.info('Creating session')
+            @registry.add_listener(self)
+            @schema.add_listener(self)
 
-            failed_connections = connections.reject(&:connected?)
+            futures = connecting_hosts.map do |(host, pool_size)|
+              f = connect_to_host(host, pool_size)
+              f.recover do |error|
+                FailedConnection.new(error, host)
+              end
+            end
 
-            @logger.debug("connection future resolved with #{failed_connections.len} failed connections out of #{connections.len} connections")
+            Ione::Future.all(*futures).map do |connections|
+              connections.flatten!
+              raise NO_HOSTS if connections.empty?
+
+              failed_connections = connections.reject(&:connected?)
+
+              @logger.debug("connection future resolved with #{failed_connections.size} failed connections out of #{connections.size} connections")
 
             # convert Cassandra::Protocol::CqlProtocolHandler to something with a real host
             failed_connections.map! do |c|
